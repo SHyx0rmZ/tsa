@@ -18,11 +18,13 @@ import (
 	"code.cloudfoundry.org/lager"
 	"github.com/concourse/atc"
 	bclient "github.com/concourse/baggageclaim/client"
-
 	"github.com/concourse/tsa"
+	rclient "github.com/concourse/worker/reaper/client"
 	"github.com/tedsuo/ifrit"
 	"golang.org/x/crypto/ssh"
 )
+
+const maxForwards = 3
 
 type registrarSSHServer struct {
 	logger            lager.Logger
@@ -98,7 +100,7 @@ func (server *registrarSSHServer) handshake(logger lager.Logger, netConn net.Con
 
 	defer conn.Close()
 
-	forwardedTCPIPs := make(chan forwardedTCPIP, 2)
+	forwardedTCPIPs := make(chan forwardedTCPIP, maxForwards)
 	go server.handleForwardRequests(logger, conn, reqs, forwardedTCPIPs)
 
 	sessionID := string(conn.SessionID())
@@ -180,12 +182,16 @@ func (server *registrarSSHServer) handleChannel(
 			return
 		}
 
+		logger.Info("worker-request", lager.Data{"command": request.Command})
+
 		workerRequest, err := parseRequest(request.Command)
 		if err != nil {
 			fmt.Fprintf(channel, "invalid command: %s", err)
 			req.Reply(false, nil)
 			continue
 		}
+
+		logger.Info("worker-request", lager.Data{"request": workerRequest})
 
 		switch r := workerRequest.(type) {
 		case landWorkerRequest:
@@ -261,6 +267,7 @@ func (server *registrarSSHServer) handleChannel(
 				case forwarded := <-forwardedTCPIPs:
 					logger.Info("forwarded-tcpip", lager.Data{
 						"bound-port": forwarded.boundPort,
+						"bindAddr":   forwarded.bindAddr,
 					})
 
 					processes = append(processes, forwarded.process)
@@ -278,11 +285,13 @@ func (server *registrarSSHServer) handleChannel(
 				return
 
 			case 1:
+				logger.Info("register-for-1", lager.Data{"forwardMap": forwards})
 				for _, gardenForward := range forwards {
 					process, err := server.continuouslyRegisterForwardedWorker(
 						logger,
 						channel,
 						gardenForward.boundPort,
+						0,
 						0,
 						sessionID,
 					)
@@ -297,6 +306,7 @@ func (server *registrarSSHServer) handleChannel(
 				}
 
 			case 2:
+				logger.Info("register-for-2", lager.Data{"forwardMap": forwards})
 				gardenForward, found := forwards[r.gardenAddr]
 				if !found {
 					fmt.Fprintf(channel, "garden address %s not found in forwards\n", r.gardenAddr)
@@ -314,6 +324,41 @@ func (server *registrarSSHServer) handleChannel(
 					channel,
 					gardenForward.boundPort,
 					baggageclaimForward.boundPort,
+					0,
+					sessionID,
+				)
+				if err != nil {
+					logger.Error("failed-to-register", err)
+					return
+				}
+				watchForProcessToExit(logger, process, channel)
+				processes = append(processes, process)
+			case 3:
+				logger.Info("register-for-3", lager.Data{"forwardMap": forwards})
+				gardenForward, found := forwards[r.gardenAddr]
+				if !found {
+					fmt.Fprintf(channel, "garden address %s not found in forwards\n", r.gardenAddr)
+					return
+				}
+
+				baggageclaimForward, found := forwards[r.baggageclaimAddr]
+				if !found {
+					fmt.Fprintf(channel, "baggageclaim address %s not found in forwards\n", r.gardenAddr)
+					return
+				}
+
+				reaperForward, found := forwards[r.reaperAddr]
+				if !found {
+					fmt.Fprintf(channel, "reaper address %s not found in forwards\n", r.reaperAddr)
+					return
+				}
+
+				process, err := server.continuouslyRegisterForwardedWorker(
+					logger,
+					channel,
+					gardenForward.boundPort,
+					baggageclaimForward.boundPort,
+					reaperForward.boundPort,
 					sessionID,
 				)
 				if err != nil {
@@ -323,7 +368,6 @@ func (server *registrarSSHServer) handleChannel(
 				watchForProcessToExit(logger, process, channel)
 				processes = append(processes, process)
 			}
-
 		default:
 			logger.Info("invalid-command", lager.Data{
 				"command": request.Command,
@@ -443,6 +487,7 @@ func (server *registrarSSHServer) continuouslyRegisterForwardedWorker(
 	channel ssh.Channel,
 	gardenPort uint32,
 	baggageclaimPort uint32,
+	reaperPort uint32,
 	sessionID string,
 ) (ifrit.Process, error) {
 	logger.Session("start")
@@ -465,16 +510,27 @@ func (server *registrarSSHServer) continuouslyRegisterForwardedWorker(
 		worker.BaggageclaimURL = fmt.Sprintf("http://%s:%d", server.forwardHost, baggageclaimPort)
 	}
 
+	if reaperPort != 0 {
+		worker.ReaperAddr = fmt.Sprintf("http://%s:%d", server.forwardHost, reaperPort)
+	}
+
 	return server.heartbeatWorker(logger, worker, channel), nil
 }
 
 func (server *registrarSSHServer) heartbeatWorker(logger lager.Logger, worker atc.Worker, channel ssh.Channel) ifrit.Process {
+	logger.Info("heartbeat-worker", lager.Data{"worker": worker})
 	return ifrit.Background(tsa.NewHeartbeater(
 		logger,
 		clock.NewClock(),
 		server.heartbeatInterval,
 		server.cprInterval,
 		gclient.New(gconn.NewWithDialerAndLogger(keepaliveDialerFactory("tcp", worker.GardenAddr), logger.Session("garden-connection"))),
+		rclient.NewWithHttpClient(worker.ReaperAddr, logger.Session("reaper-connection"), &http.Client{
+			Transport: &http.Transport{
+				DisableKeepAlives:     true,
+				ResponseHeaderTimeout: 1 * time.Minute,
+			},
+		}),
 		bclient.NewWithHTTPClient(worker.BaggageclaimURL, &http.Client{
 			Transport: &http.Transport{
 				DisableKeepAlives:     true,
@@ -503,7 +559,7 @@ func (server *registrarSSHServer) handleForwardRequests(
 
 			forwardedThings++
 
-			if forwardedThings > 2 {
+			if forwardedThings > maxForwards {
 				logger.Info("rejecting-extra-forward-request")
 				r.Reply(false, nil)
 				continue
@@ -663,7 +719,7 @@ func forwardLocalConn(logger lager.Logger, cancel <-chan struct{}, localConn net
 		}
 	}()
 
-	wait := make(chan struct{}, 2)
+	wait := make(chan struct{}, maxForwards)
 
 	pipe := func(to io.WriteCloser, from io.ReadCloser) {
 		// if either end breaks, close both ends to ensure they're both unblocked,
@@ -689,7 +745,7 @@ dance:
 		select {
 		case <-wait:
 			done++
-			if done == 2 {
+			if done == maxForwards {
 				break dance
 			}
 
